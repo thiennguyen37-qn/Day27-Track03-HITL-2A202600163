@@ -9,8 +9,10 @@ different messages on different PRs.
 from __future__ import annotations
 
 import argparse
+import json as _json
 
 from dotenv import load_dotenv
+from json_repair import repair_json
 from langgraph.graph import END, START, StateGraph
 from rich.console import Console
 
@@ -38,24 +40,68 @@ def node_fetch_pr(state: ReviewState) -> dict:
     }
 
 
+def _fix_analysis_json(data: dict) -> PRAnalysis:
+    """Normalize common LLM schema mistakes before Pydantic validation."""
+    for alias in ("confidence_re", "confidence_rereasoning", "confidence_reason", "reasoning"):
+        if alias in data and "confidence_reasoning" not in data:
+            data["confidence_reasoning"] = data.pop(alias)
+    if "confidence_reasoning" not in data:
+        data["confidence_reasoning"] = ""
+    data["comments"] = [
+        c for c in data.get("comments", [])
+        if isinstance(c.get("file"), str) and c.get("file")
+    ]
+    for comment in data["comments"]:
+        if not isinstance(comment.get("line"), int):
+            comment["line"] = None
+    return PRAnalysis.model_validate(data)
+
+
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    # TODO: call the LLM with structured output PRAnalysis.
-    # Hint:  llm = get_llm().with_structured_output(PRAnalysis)
-    #        analysis = llm.invoke([...])
-    #        return {"analysis": analysis}
-    # When implemented, wrap the call in:
-    #        with console.status("[dim]LLM thinking...[/dim]"):
-    #            analysis = llm.invoke([...])
-    raise NotImplementedError("Implement node_analyze")
+    llm = get_llm()
+    system = "You are a strict security-focused code reviewer. Output ONLY valid JSON — no markdown, no extra text."
+    prompt = (
+        f"Review this pull request for SAFETY TO MERGE.\n"
+        f"Title: {state['pr_title']}\n"
+        f"Files: {', '.join(state['pr_files'])}\n\n"
+        f"Diff:\n{state['pr_diff']}\n\n"
+        "confidence = probability this PR is SAFE TO MERGE without any human review.\n"
+        "Lower confidence when you see: security issues, auth/crypto code, SQL queries, "
+        "missing tests, schema migrations, hard-coded secrets, or anything unclear.\n"
+        "confidence < 0.58 → escalate (serious risks, need human answers)\n"
+        "confidence 0.58–0.72 → human approval needed\n"
+        "confidence > 0.72 → safe to auto-approve (trivial/mechanical only)\n\n"
+        "Return a JSON object with EXACTLY these fields (keep values SHORT):\n"
+        '{"summary":"2 sentences max","risk_factors":["up to 3 items"],'
+        '"comments":[{"file":"filename","line":null,"severity":"nit|suggestion|issue|blocker","body":"short"}],'
+        '"confidence":0.0,"confidence_reasoning":"1 sentence","escalation_questions":[]}\n'
+        "Rules:\n"
+        "- comments: max 3 items\n"
+        "- line: integer or null (never a string)\n"
+        "- if confidence < 0.58 add specific escalation_questions\n"
+        "- field name is confidence_reasoning (required, not optional)"
+    )
+    with console.status("[dim]LLM thinking...[/dim]"):
+        msg = llm.invoke([("system", system), ("human", prompt)])
+    content = msg.content.strip()
+    data = repair_json(content, return_objects=True)
+    analysis = _fix_analysis_json(data)
+    console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}  risks={len(analysis.risk_factors)}")
+    return {"analysis": analysis}
 
 
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
-    # TODO: read state["analysis"].confidence and return
-    #       {"decision": "auto_approve" | "human_approval" | "escalate"}
-    # Thresholds provided: AUTO_APPROVE_THRESHOLD (0.85) and ESCALATE_THRESHOLD (0.60).
-    raise NotImplementedError("Implement node_route")
+    confidence = state["analysis"].confidence
+    if confidence >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif confidence < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
+    console.print(f"  [green]✓[/green] decision={decision}")
+    return {"decision": decision}
 
 
 def node_auto_approve(state: ReviewState) -> dict:
@@ -75,11 +121,24 @@ def node_escalate(state: ReviewState) -> dict:
 
 def build_graph():
     g = StateGraph(ReviewState)
-    # TODO: add_node for the 6 nodes above (fetch_pr, analyze, route, auto_approve, human_approval, escalate)
-    # TODO: add_edge from START → fetch_pr → analyze → route
-    # TODO: add_conditional_edges on "route" with mapping
-    #       {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"}
-    # TODO: add_edge from each terminal node → END
+    g.add_node("fetch_pr", node_fetch_pr)
+    g.add_node("analyze", node_analyze)
+    g.add_node("route", node_route)
+    g.add_node("auto_approve", node_auto_approve)
+    g.add_node("human_approval", node_human_approval)
+    g.add_node("escalate", node_escalate)
+
+    g.add_edge(START, "fetch_pr")
+    g.add_edge("fetch_pr", "analyze")
+    g.add_edge("analyze", "route")
+    g.add_conditional_edges(
+        "route",
+        lambda state: state["decision"],
+        {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
+    )
+    g.add_edge("auto_approve", END)
+    g.add_edge("human_approval", END)
+    g.add_edge("escalate", END)
     return g.compile()
 
 

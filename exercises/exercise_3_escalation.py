@@ -10,6 +10,7 @@ import argparse
 import uuid
 
 from dotenv import load_dotenv
+from json_repair import repair_json
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -37,18 +38,47 @@ def node_fetch_pr(state):
     return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
 
 
+def _fix_analysis_json(data: dict) -> PRAnalysis:
+    for alias in ("confidence_re", "confidence_rereasoning", "confidence_reason", "reasoning"):
+        if alias in data and "confidence_reasoning" not in data:
+            data["confidence_reasoning"] = data.pop(alias)
+    if "confidence_reasoning" not in data:
+        data["confidence_reasoning"] = ""
+    data["comments"] = [
+        c for c in data.get("comments", [])
+        if isinstance(c.get("file"), str) and c.get("file")
+    ]
+    for c in data["comments"]:
+        if not isinstance(c.get("line"), int):
+            c["line"] = None
+    return PRAnalysis.model_validate(data)
+
+
 def node_analyze(state):
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    llm = get_llm()
+    system = "You are a strict security-focused code reviewer. Output ONLY valid JSON — no markdown, no extra text."
+    prompt = (
+        f"Review this pull request for SAFETY TO MERGE.\n"
+        f"Title: {state['pr_title']}\n"
+        f"Files: {', '.join(state['pr_files'])}\n\n"
+        f"Diff:\n{state['pr_diff']}\n\n"
+        "confidence = probability this PR is SAFE TO MERGE without any human review.\n"
+        "Lower confidence when you see: security issues, auth/crypto code, SQL queries, "
+        "missing tests, schema migrations, hard-coded secrets, or anything unclear.\n"
+        "confidence < 0.58 → escalate. Populate escalation_questions with 2–4 specific questions "
+        "referencing the exact file/section in the diff that concerns you.\n"
+        "confidence 0.58–0.72 → human approval needed\n"
+        "confidence > 0.72 → safe to auto-approve (trivial only)\n\n"
+        'Return JSON: {"summary":"2 sentences","risk_factors":["max 3"],'
+        '"comments":[{"file":"f","line":null,"severity":"nit|suggestion|issue|blocker","body":"short"}],'
+        '"confidence":0.0,"confidence_reasoning":"1 sentence","escalation_questions":["specific question referencing file/line"]}\n'
+        "line must be integer or null. confidence_reasoning is required."
+    )
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
-        ])
+        msg = llm.invoke([("system", system), ("human", prompt)])
+    data = repair_json(msg.content.strip(), return_objects=True)
+    analysis = _fix_analysis_json(data)
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
     return {"analysis": analysis}
 
@@ -71,22 +101,44 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    a = state["analysis"]
+    answers = state["escalation_answers"]
+    qa_text = "\n".join(f"Q: {q}\nA: {ans}" for q, ans in answers.items())
+    llm = get_llm()
+    system = "You are a strict security-focused code reviewer. Output ONLY valid JSON — no markdown, no extra text."
+    prompt = (
+        f"You previously reviewed this PR and had low confidence.\n"
+        f"Title: {state['pr_title']}\n\n"
+        f"Original diff:\n{state['pr_diff']}\n\n"
+        f"Your initial summary: {a.summary}\n"
+        f"Initial risk factors: {a.risk_factors}\n\n"
+        f"A human reviewer answered your questions:\n{qa_text}\n\n"
+        "Using the answers, produce a refined review with updated confidence.\n"
+        'Return JSON: {"summary":"2 sentences","risk_factors":["max 3"],'
+        '"comments":[{"file":"f","line":null,"severity":"nit|suggestion|issue|blocker","body":"short"}],'
+        '"confidence":0.0,"confidence_reasoning":"1 sentence","escalation_questions":[]}\n'
+        "line must be integer or null. confidence_reasoning is required."
+    )
+    with console.status("[dim]LLM synthesizing refined review...[/dim]"):
+        msg = llm.invoke([("system", system), ("human", prompt)])
+    data = repair_json(msg.content.strip(), return_objects=True)
+    refined = _fix_analysis_json(data)
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,7 +213,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 

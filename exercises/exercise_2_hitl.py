@@ -8,9 +8,11 @@ then resume the graph with Command(resume=<user choice>).
 from __future__ import annotations
 
 import argparse
+import json as _json
 import uuid
 
 from dotenv import load_dotenv
+from json_repair import repair_json
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -38,14 +40,46 @@ def node_fetch_pr(state: ReviewState) -> dict:
     return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
 
 
+def _fix_analysis_json(data: dict) -> PRAnalysis:
+    for alias in ("confidence_re", "confidence_rereasoning", "confidence_reason", "reasoning"):
+        if alias in data and "confidence_reasoning" not in data:
+            data["confidence_reasoning"] = data.pop(alias)
+    if "confidence_reasoning" not in data:
+        data["confidence_reasoning"] = ""
+    data["comments"] = [
+        c for c in data.get("comments", [])
+        if isinstance(c.get("file"), str) and c.get("file")
+    ]
+    for c in data["comments"]:
+        if not isinstance(c.get("line"), int):
+            c["line"] = None
+    return PRAnalysis.model_validate(data)
+
+
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    llm = get_llm()
+    system = "You are a strict security-focused code reviewer. Output ONLY valid JSON — no markdown, no extra text."
+    prompt = (
+        f"Review this pull request for SAFETY TO MERGE.\n"
+        f"Title: {state['pr_title']}\n"
+        f"Files: {', '.join(state['pr_files'])}\n\n"
+        f"Diff:\n{state['pr_diff']}\n\n"
+        "confidence = probability this PR is SAFE TO MERGE without any human review.\n"
+        "Lower confidence when you see: security issues, auth/crypto code, SQL queries, "
+        "missing tests, schema migrations, hard-coded secrets, or anything unclear.\n"
+        "confidence < 0.58 → escalate (serious risks)\n"
+        "confidence 0.58–0.72 → human approval needed\n"
+        "confidence > 0.72 → safe to auto-approve (trivial only)\n\n"
+        'Return JSON: {"summary":"2 sentences","risk_factors":["max 3"],'
+        '"comments":[{"file":"f","line":null,"severity":"nit|suggestion|issue|blocker","body":"short"}],'
+        '"confidence":0.0,"confidence_reasoning":"1 sentence","escalation_questions":[]}\n'
+        "line must be integer or null. confidence_reasoning is required."
+    )
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
-        ])
+        msg = llm.invoke([("system", system), ("human", prompt)])
+    data = repair_json(msg.content.strip(), return_objects=True)
+    analysis = _fix_analysis_json(data)
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
     return {"analysis": analysis}
 
@@ -63,17 +97,15 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -133,8 +165,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +205,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
